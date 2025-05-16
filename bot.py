@@ -4,23 +4,40 @@ import logging
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import RPCError
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения
 load_dotenv()
+
+# Проверка обязательных переменных окружения
+required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN']
+for var in required_vars:
+    if not os.getenv(var):
+        logger.error(f'Необходимо установить переменную окружения {var}')
+        exit(1)
+
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("MusicFetcherBot")
-
+# Создание директории для загрузок
 os.makedirs("downloads", exist_ok=True)
 
+# Конфигурация yt-dlp
 YDL_OPTS_VIDEO = {
     "format": "bestvideo+bestaudio/best",
     "outtmpl": "downloads/%(title)s.%(ext)s",
     "merge_output_format": "mp4",
     "quiet": True,
     "noplaylist": True,
+    "extract_flat": False,
 }
 
 YDL_OPTS_AUDIO = {
@@ -28,6 +45,7 @@ YDL_OPTS_AUDIO = {
     "outtmpl": "downloads/%(title)s.%(ext)s",
     "quiet": True,
     "noplaylist": True,
+    "extract_flat": False,
     "postprocessors": [{
         "key": "FFmpegExtractAudio",
         "preferredcodec": "mp3",
@@ -35,105 +53,131 @@ YDL_OPTS_AUDIO = {
     }],
 }
 
-app = Client("music_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Инициализация клиента Pyrogram
+app = Client(
+    "music_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-# Хранит ссылки и выбор пользователя (видео или аудио)
+# Хранилище пользовательских выборов
 user_choices = {}
 
-def progress_hook(msg):
-    last_percent = {'value': None}
-
-    def create_progress_bar(percent_float, length=20):
-        filled_length = int(length * percent_float // 100)
-        bar = '█' * filled_length + '-' * (length - filled_length)
-        return f"[{bar}] {percent_float:.1f}%"
-
+def progress_hook(msg: Message):
+    last_percent = {'value': 0}
+    
     def hook(d):
         if d['status'] == 'downloading':
-            percent_str = d.get('_percent_str', '').strip()
-            try:
-                percent_float = float(percent_str.replace('%', ''))
-            except:
-                percent_float = 0.0
-            if percent_str != last_percent['value']:
-                last_percent['value'] = percent_str
-                progress_line = create_progress_bar(percent_float)
+            percent = d.get('_percent_str', '0%').strip()
+            if percent != last_percent['value']:
+                last_percent['value'] = percent
                 try:
-                    app.loop.create_task(msg.edit(f"🔄 Загружаю... {progress_line}"))
+                    app.loop.create_task(
+                        msg.edit(f"🔄 Загружаю... {percent}")
+                    )
                 except Exception as e:
-                    logger.warning(f"Не удалось обновить прогресс: {e}")
+                    logger.warning(f"Ошибка обновления прогресса: {e}")
         elif d['status'] == 'finished':
             try:
-                app.loop.create_task(msg.edit("✅ Загрузка завершена, обрабатываю..."))
+                app.loop.create_task(
+                    msg.edit("✅ Загрузка завершена, обрабатываю...")
+                )
             except Exception as e:
-                logger.warning(f"Не удалось обновить сообщение о завершении: {e}")
-
+                logger.warning(f"Ошибка обновления статуса завершения: {e}")
+    
     return hook
 
 @app.on_message(filters.command("start"))
-async def start_cmd(client, message: Message):
-    await message.reply("🎬 Привет! Скинь ссылку на TikTok или YouTube, и я скачаю видео или аудио для тебя!")
+async def start_cmd(client: Client, message: Message):
+    try:
+        await message.reply(
+            "🎬 Привет! Отправь мне ссылку на видео с YouTube или TikTok, "
+            "и я скачаю его для тебя в видео или аудио формате!"
+        )
+    except RPCError as e:
+        logger.error(f"Ошибка в start_cmd: {e}")
 
-@app.on_message(filters.text & ~filters.command(["start"]))
-async def ask_choice(client, message: Message):
+@app.on_message(filters.text & ~filters.command(["start", "help"]))
+async def handle_url(client: Client, message: Message):
     url = message.text.strip()
-    user_choices[message.from_user.id] = {'url': url, 'choice': None}
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎥 Видео", callback_data="download_video"),
-         InlineKeyboardButton("🎧 Аудио", callback_data="download_audio")]
-    ])
-    await message.reply("Что качаем? Видео или аудио?", reply_markup=keyboard)
+    if not url.startswith(('http://', 'https://')):
+        await message.reply("⚠️ Пожалуйста, отправьте корректную ссылку на видео.")
+        return
+    
+    user_id = message.from_user.id
+    user_choices[user_id] = {'url': url}
+    
+    try:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎥 Видео", callback_data="video"),
+             InlineKeyboardButton("🎧 Аудио", callback_data="audio")]
+        ])
+        await message.reply(
+            "Выберите формат для скачивания:",
+            reply_markup=keyboard
+        )
+    except RPCError as e:
+        logger.error(f"Ошибка при отправке клавиатуры: {e}")
+        await message.reply("Произошла ошибка. Пожалуйста, попробуйте позже.")
 
 @app.on_callback_query()
-async def callback_handler(client, callback_query):
+async def callback_handler(client: Client, callback_query):
     user_id = callback_query.from_user.id
     data = callback_query.data
-
-    if user_id not in user_choices or 'url' not in user_choices[user_id]:
-        await callback_query.answer("Пожалуйста, сначала пришли ссылку.")
+    
+    if user_id not in user_choices:
+        await callback_query.answer("Ссылка устарела. Отправьте новую.")
         return
-
+    
     url = user_choices[user_id]['url']
-
-    if data == "download_video":
-        user_choices[user_id]['choice'] = "video"
-        await callback_query.answer("Скачиваю видео...")
-        await process_download(client, callback_query.message, url, download_type="video")
-
-    elif data == "download_audio":
-        user_choices[user_id]['choice'] = "audio"
-        await callback_query.answer("Скачиваю аудио...")
-        await process_download(client, callback_query.message, url, download_type="audio")
-
-async def process_download(client, msg: Message, url: str, download_type: str):
-    progress_msg = await msg.reply("🔄 Загружаю... 0%")
-    my_hook = progress_hook(progress_msg)
-
-    opts = YDL_OPTS_VIDEO.copy() if download_type == "video" else YDL_OPTS_AUDIO.copy()
-    opts['progress_hooks'] = [my_hook]
-
+    await callback_query.answer()
+    
     try:
+        progress_msg = await callback_query.message.reply("🔄 Начинаю загрузку...")
+        
+        opts = YDL_OPTS_VIDEO if data == "video" else YDL_OPTS_AUDIO
+        opts['progress_hooks'] = [progress_hook(progress_msg)]
+        
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-
-        if download_type == "audio":
-            filename = os.path.splitext(filename)[0] + ".mp3"
-
-        if download_type == "audio":
-            await msg.reply_audio(audio=filename, title=info.get("title"), performer=info.get("uploader"))
-        else:
-            await msg.reply_video(video=filename, caption=info.get("title"))
-
-        logger.info(f"✅ Отправлен файл: {filename}")
-        await progress_msg.delete()
-        os.remove(filename)
-
+            
+            if data == "audio":
+                filename = os.path.splitext(filename)[0] + ".mp3"
+            
+            if os.path.getsize(filename) > 50 * 1024 * 1024:  # 50MB limit
+                raise ValueError("Файл слишком большой для отправки в Telegram")
+            
+            if data == "audio":
+                await callback_query.message.reply_audio(
+                    audio=filename,
+                    title=info.get('title', 'Аудио'),
+                    performer=info.get('uploader', 'Неизвестный исполнитель')
+                )
+            else:
+                await callback_query.message.reply_video(
+                    video=filename,
+                    caption=info.get('title', 'Видео')
+                )
+            
+            await progress_msg.delete()
+            os.remove(filename)
+            
+    except yt_dlp.DownloadError as e:
+        logger.error(f"Ошибка загрузки: {e}")
+        await progress_msg.edit("⚠️ Ошибка при загрузке видео. Проверьте ссылку.")
+    except RPCError as e:
+        logger.error(f"Ошибка Telegram API: {e}")
+        await progress_msg.edit("⚠️ Ошибка при отправке файла. Попробуйте позже.")
     except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
-        await progress_msg.edit("⚠️ Ошибка при загрузке. Проверь ссылку и попробуй ещё раз.")
+        logger.error(f"Неожиданная ошибка: {e}")
+        await progress_msg.edit("⚠️ Произошла непредвиденная ошибка.")
+    finally:
+        if 'filename' in locals() and os.path.exists(filename):
+            os.remove(filename)
+        user_choices.pop(user_id, None)
 
 if __name__ == "__main__":
+    logger.info("Запуск бота...")
     app.run()
-
