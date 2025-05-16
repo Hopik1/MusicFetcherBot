@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: musicfetcherbot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: API_ID
+        value: твое_число
+      - key: API_HASH
+        value: твоя_строка
+      - key: BOT_TOKEN
+        value: твой_токен
